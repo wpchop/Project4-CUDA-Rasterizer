@@ -640,13 +640,26 @@ void _vertexTransformAndAssembly(
 		// Then divide the pos by its w element to transform into NDC space
 		// Finally transform x and y to viewport space
 		VertexIndex vIndex = primitive.dev_indices[vid];
-		VertexAttributePosition vPos = primitive.dev_position[vIndex];
-		VertexAttributeNormal vNormal = primitive.dev_normal[vIndex];
-		VertexAttributeTexcoord vTexcoord = primitive.dev_texcoord0[vIndex];
+		VertexAttributePosition vPos = primitive.dev_position[vid];
+		VertexAttributeNormal vNormal = primitive.dev_normal[vid];
+		VertexAttributeTexcoord vTexcoord = primitive.dev_texcoord0[vid];
+
+		// NDC
+		glm::vec4 vOutPos = MVP * glm::vec4(vPos, 1.0f);
+		vOutPos = vOutPos / vOutPos.w;
+
+		// Screen Space
+		vOutPos = glm::vec4(0.5f * (float) width * (vOutPos.x + 1.0f), 0.5f * (float) height * (1.0f - vOutPos.y), vOutPos.z, 1.0f);
+
+		glm::vec3 eyePos = glm::vec3(MV * glm::vec4(vPos, 0));
 		
-		// Note to self: This should be in NDC.
 		VertexOut vOut;
-		vOut.pos = glm::vec4(vPos.x, vPos.y, vPos.z, 1);
+		// vOut.pos = glm::vec4(vPos.x, vPos.y, vPos.z, 1);
+		vOut.pos = vOutPos;
+		vOut.eyeNor = glm::vec3(MV * glm::vec4(vNormal,0.0f));
+		vOut.texcoord0 = vTexcoord;
+		vOut.eyePos = eyePos;
+
 		primitive.dev_verticesOut[vid] = vOut;
 
 		// TODO: Apply vertex assembly here
@@ -686,10 +699,63 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 	
 }
 
-__global__
-void _rasterizeTriangles(int numPrimitives, Fragment* dev_fragments, Primitive* dev_primitives) {
-
+__device__
+glm::vec3 barycentricInterpolation(const glm::vec3 tri[3], const glm::vec3 coord) {
+	return coord.x * tri[0] + coord.y * tri[1] + coord.z * tri[2];
 }
+
+__global__
+void _rasterizeTriangles(int numPrimitives, int numFragments, int width, Fragment* dev_fragments, Primitive* dev_primitives, int* dev_depth) {
+	int iid = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (iid < numPrimitives) {
+		Primitive triangle = dev_primitives[iid];
+		glm::vec3 tri[3] = { glm::vec3(triangle.v[0].pos), 
+							 glm::vec3(triangle.v[1].pos), 
+							 glm::vec3(triangle.v[2].pos) };
+		AABB boundingBox = getAABBForTriangle(tri);
+
+		for (int y = boundingBox.min.y; y < boundingBox.max.y; y++) {
+			for (int x = boundingBox.min.x; x < boundingBox.max.x; x++) {
+				Fragment f;
+				glm::vec3 bary = calculateBarycentricCoordinate(tri, glm::vec2((float)x, (float)y));
+				if (isBarycentricCoordInBounds(bary)) {
+					
+
+
+					f.color = glm::vec3(1, 0, 1);
+					// glm::vec3 uuh[3] = { glm::vec3(1,1,1) , glm::vec3(1,0,1) , glm::vec3(1,0,1) };
+					//f.color = barycentricInterpolation(uuh, bary);
+
+					glm::vec3 eyePos[3] = { triangle.v[0].eyePos, triangle.v[1].eyePos, triangle.v[2].eyePos };
+					f.eyePos = barycentricInterpolation(eyePos, bary);
+
+					glm::vec3 eyeNormals[3] = { triangle.v[0].eyeNor, triangle.v[1].eyeNor, triangle.v[2].eyeNor };
+					f.eyeNor = barycentricInterpolation(eyeNormals, bary);
+
+					glm::vec3 pos = barycentricInterpolation(tri, bary);
+
+					int old = dev_depth[y*width + x];
+					
+
+					atomicMin(&dev_depth[y*width + x], (int)( pos.z * INT_MAX));
+
+					if (old != dev_depth[y*width + x]) {
+						f.color = barycentricInterpolation(eyeNormals, bary);
+						//f.color = glm::vec3(1, 1, 1);
+					}
+
+
+					f.texcoord0 = triangle.v[0].texcoord0;
+					f.dev_diffuseTex = triangle.v[0].dev_diffuseTex;
+					dev_fragments[y * width + x] = f;
+				}
+			}
+		}
+	}
+}
+
+
 
 
 
@@ -746,7 +812,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	// TODO: rasterize
 	dim3 numThreadsPerBlock(128);
 	dim3 numBlocksForPrimitives((curPrimitiveBeginId + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
-	// _rasterizeTriangle << < numBlocksForPrimitives, numThreadsPerBlock >> > ();
+	_rasterizeTriangles << < numBlocksForPrimitives, numThreadsPerBlock >> > (curPrimitiveBeginId, width*height, width, dev_fragmentBuffer, dev_primitives, dev_depth);
 
 
     // Copy depthbuffer colors into framebuffer
