@@ -18,6 +18,11 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#define ATOMIC 1
+#define POINT 0
+#define LINE 0
+#define TRIANGLE 1
+
 namespace {
 
 	typedef unsigned short VertexIndex;
@@ -46,7 +51,7 @@ namespace {
 		// glm::vec3 col;
 		 glm::vec2 texcoord0;
 		 TextureData* dev_diffuseTex = NULL;
-		// int texWidth, texHeight;
+		 int texWidth, texHeight;
 		// ...
 	};
 
@@ -66,7 +71,7 @@ namespace {
 		 glm::vec3 eyeNor;
 		 VertexAttributeTexcoord texcoord0;
 		 TextureData* dev_diffuseTex;
-		// ...
+		 int texWidth, texHeight;
 	};
 
 	struct PrimitiveDevBufPointers {
@@ -94,6 +99,7 @@ namespace {
 		VertexOut* dev_verticesOut;
 
 		// TODO: add more attributes when needed
+
 	};
 
 }
@@ -110,6 +116,7 @@ static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
 
 static int * dev_depth = NULL;	// you might need this buffer when doing depth test
+static unsigned int * dev_mutex = NULL;
 
 /**
  * Kernel that writes the image to the OpenGL PBO directly.
@@ -133,6 +140,16 @@ void sendImageToPBO(uchar4 *pbo, int w, int h, glm::vec3 *image) {
     }
 }
 
+__device__
+glm::vec3 getColor(TextureData* dev_texcoord0, int u, int v, int width) {
+
+	int	index = u + v*width;
+	float r = (float) dev_texcoord0[index * 3] / 255.0f;
+	float g = (float) dev_texcoord0[index * 3 + 1] / 255.0f;
+	float b = (float) dev_texcoord0[index * 3 + 2] / 255.0f;
+	return glm::vec3(r, g, b);
+}
+
 /** 
 * Writes fragment colors to the framebuffer
 */
@@ -146,8 +163,38 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
         framebuffer[index] = fragmentBuffer[index].color;
 
 		// TODO: add your fragment shader code here
+		Fragment frag = fragmentBuffer[index];
 
+		glm::vec3 lightPos = glm::vec3(0.0f, 5.0f, 0.0f);
+		glm::vec3 ambientCol = frag.color;
+
+		if (frag.color != glm::vec3(0.0, 0.0, 0.0)) {
+			//ambientCol = getColor(frag.dev_diffuseTex, frag.texcoord0.x * frag.texWidth, frag.texHeight * frag.texHeight, frag.texWidth);
+		}
+
+		glm::vec3 diffuseCol = glm::vec3(0.5f, 0.0f, 0.0f);
+		glm::vec3 specColor = glm::vec3(1.0f, 1.0f, 1.0f);
+		const float shininess = 16.0;
+		const float screenGamma = 2.2;
+
+		glm::vec3 lightDir = normalize(lightPos - fragmentBuffer[index].eyePos);
+		glm::vec3 normal = fragmentBuffer[index].eyeNor;
+
+		float lambertian = max(dot(lightDir, normal), 0.0f);
+		float specular = 0.0;
+		if (lambertian > 0.0) {
+			glm::vec3 viewDir = normalize(-fragmentBuffer[index].eyePos);
+
+			glm::vec3 halfDir = normalize(lightDir + viewDir);
+			float specAngle = max(dot(halfDir, normal), 0.0f);
+			specular = pow(specAngle, shininess);
+		}
+		glm::vec3 colorLinear = ambientCol + lambertian * diffuseCol + specular*specColor;
+
+		glm::vec3 colorGammaCorrected = pow(colorLinear, glm::vec3(1.0f / screenGamma));
+		framebuffer[index] = colorGammaCorrected;
     }
+
 }
 
 /**
@@ -166,11 +213,14 @@ void rasterizeInit(int w, int h) {
 	cudaFree(dev_depth);
 	cudaMalloc(&dev_depth, width * height * sizeof(int));
 
+	cudaFree(dev_mutex);
+	cudaMalloc(&dev_mutex, width*height * sizeof(unsigned int));
+
 	checkCUDAError("rasterizeInit");
 }
 
 __global__
-void initDepth(int w, int h, int * depth)
+void initDepth(int w, int h, int * depth, unsigned int * mutex)
 {
 	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
 	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
@@ -179,6 +229,7 @@ void initDepth(int w, int h, int * depth)
 	{
 		int index = x + (y * w);
 		depth[index] = INT_MAX;
+		mutex[index] = 0;
 	}
 }
 
@@ -659,6 +710,8 @@ void _vertexTransformAndAssembly(
 		vOut.eyeNor = glm::vec3(MV * glm::vec4(vNormal,0.0f));
 		vOut.texcoord0 = vTexcoord;
 		vOut.eyePos = eyePos;
+		vOut.texHeight = primitive.diffuseTexHeight;
+		vOut.texWidth = primitive.diffuseTexWidth;
 
 		primitive.dev_verticesOut[vid] = vOut;
 
@@ -704,8 +757,13 @@ glm::vec3 barycentricInterpolation(const glm::vec3 tri[3], const glm::vec3 coord
 	return coord.x * tri[0] + coord.y * tri[1] + coord.z * tri[2];
 }
 
+__device__
+glm::vec2 perspectiveInterp(const glm::vec2 texcoord[3], const glm::vec3 coord) {
+	return (float) coord.x * texcoord[0] + (float) coord.y * texcoord[1] + (float) coord.z * texcoord[2];
+}
+
 __global__
-void _rasterizeTriangles(int numPrimitives, int numFragments, int width, Fragment* dev_fragments, Primitive* dev_primitives, int* dev_depth) {
+void _rasterizeTriangles(int numPrimitives, int numFragments, int width, Fragment* dev_fragments, Primitive* dev_primitives, int* dev_depth, unsigned int * dev_mutex) {
 	int iid = (blockIdx.x * blockDim.x) + threadIdx.x;
 
 	if (iid < numPrimitives) {
@@ -720,35 +778,52 @@ void _rasterizeTriangles(int numPrimitives, int numFragments, int width, Fragmen
 				Fragment f;
 				glm::vec3 bary = calculateBarycentricCoordinate(tri, glm::vec2((float)x, (float)y));
 				if (isBarycentricCoordInBounds(bary)) {
-					
-
-
-					f.color = glm::vec3(1, 0, 1);
-					// glm::vec3 uuh[3] = { glm::vec3(1,1,1) , glm::vec3(1,0,1) , glm::vec3(1,0,1) };
-					//f.color = barycentricInterpolation(uuh, bary);
-
+					// eyePos
 					glm::vec3 eyePos[3] = { triangle.v[0].eyePos, triangle.v[1].eyePos, triangle.v[2].eyePos };
 					f.eyePos = barycentricInterpolation(eyePos, bary);
 
+					// eyeNormals
 					glm::vec3 eyeNormals[3] = { triangle.v[0].eyeNor, triangle.v[1].eyeNor, triangle.v[2].eyeNor };
 					f.eyeNor = barycentricInterpolation(eyeNormals, bary);
 
+					// pos
 					glm::vec3 pos = barycentricInterpolation(tri, bary);
 
-					int old = dev_depth[y*width + x];
+					// textures: 
+					// TODO Perspective correction
+					glm::vec2 texCoord[3] = { triangle.v[0].texcoord0, triangle.v[1].texcoord0, triangle.v[2].texcoord0 };
+					glm::vec2 texCoordinate = glm::vec2(perspectiveInterp(texCoord, bary));
+
+					f.texcoord0 = glm::vec2(texCoordinate.x*triangle.v[0].texWidth, texCoordinate.y * triangle.v[0].texHeight);
+
+					//f.texcoord0.x *= triangle.v[0].texWidth;
+					//f.texcoord0.y *= triangle.v[0].texHeight;
 					
-
-					atomicMin(&dev_depth[y*width + x], (int)( pos.z * INT_MAX));
-
-					if (old != dev_depth[y*width + x]) {
-						f.color = barycentricInterpolation(eyeNormals, bary);
-						//f.color = glm::vec3(1, 1, 1);
-					}
-
-
-					f.texcoord0 = triangle.v[0].texcoord0;
+					f.color = glm::vec3(0.3f, 0.0f, 0.3f);
 					f.dev_diffuseTex = triangle.v[0].dev_diffuseTex;
-					dev_fragments[y * width + x] = f;
+					f.texWidth = triangle.v[0].texWidth;
+					f.texHeight = triangle.v[0].texHeight;
+					
+					// Depth Buffering
+					int old = dev_depth[y*width + x];
+					bool isSet;
+					do {
+						isSet = (atomicCAS(&dev_mutex[y*width + x], 0, 1) == 0);
+						if (isSet) {
+							// Critical section goes here.
+							// The critical section MUST be inside the wait loop;
+							// if it is afterward, a deadlock will occur.
+							dev_depth[y*width + x] = min(old, (int)(pos.z * INT_MAX));
+							if (old > dev_depth[y*width + x]) {
+								dev_fragments[y * width + x] = f;
+							}
+
+						}
+						if (isSet) {
+							dev_mutex[y*width + x] = 0;
+						}
+					} while (!isSet);
+
 				}
 			}
 		}
@@ -807,12 +882,12 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	}
 	
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
-	initDepth << <blockCount2d, blockSize2d >> >(width, height, dev_depth);
+	initDepth << <blockCount2d, blockSize2d >> >(width, height, dev_depth, dev_mutex);
 	
 	// TODO: rasterize
 	dim3 numThreadsPerBlock(128);
 	dim3 numBlocksForPrimitives((curPrimitiveBeginId + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
-	_rasterizeTriangles << < numBlocksForPrimitives, numThreadsPerBlock >> > (curPrimitiveBeginId, width*height, width, dev_fragmentBuffer, dev_primitives, dev_depth);
+	_rasterizeTriangles << < numBlocksForPrimitives, numThreadsPerBlock >> > (curPrimitiveBeginId, width*height, width, dev_fragmentBuffer, dev_primitives, dev_depth, dev_mutex);
 
 
     // Copy depthbuffer colors into framebuffer
@@ -860,6 +935,9 @@ void rasterizeFree() {
 
 	cudaFree(dev_depth);
 	dev_depth = NULL;
+
+	cudaFree(dev_mutex);
+	dev_mutex = NULL;
 
     checkCUDAError("rasterize Free");
 }
