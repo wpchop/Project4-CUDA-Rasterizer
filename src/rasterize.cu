@@ -165,17 +165,19 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
 		// TODO: add your fragment shader code here
 		Fragment frag = fragmentBuffer[index];
 
-		glm::vec3 lightPos = glm::vec3(0.0f, 5.0f, 0.0f);
+		glm::vec3 lightPos = glm::vec3(60,10,10);
 		glm::vec3 ambientCol = frag.color;
 
+#if TRIANGLE
 		if (frag.color != glm::vec3(0.0, 0.0, 0.0)) {
-			//ambientCol = getColor(frag.dev_diffuseTex, frag.texcoord0.x * frag.texWidth, frag.texHeight * frag.texHeight, frag.texWidth);
+			ambientCol = getColor(frag.dev_diffuseTex, frag.texcoord0.x * frag.texWidth, frag.texcoord0.y * frag.texHeight, frag.texWidth);
 		}
+#endif
 
 		glm::vec3 diffuseCol = glm::vec3(0.5f, 0.0f, 0.0f);
 		glm::vec3 specColor = glm::vec3(1.0f, 1.0f, 1.0f);
-		const float shininess = 16.0;
-		const float screenGamma = 2.2;
+		const float shininess = 5.0;
+		const float screenGamma = 1.2;
 
 		glm::vec3 lightDir = normalize(lightPos - fragmentBuffer[index].eyePos);
 		glm::vec3 normal = fragmentBuffer[index].eyeNor;
@@ -705,13 +707,14 @@ void _vertexTransformAndAssembly(
 		glm::vec3 eyePos = glm::vec3(MV * glm::vec4(vPos, 0));
 		
 		VertexOut vOut;
-		// vOut.pos = glm::vec4(vPos.x, vPos.y, vPos.z, 1);
 		vOut.pos = vOutPos;
 		vOut.eyeNor = glm::vec3(MV * glm::vec4(vNormal,0.0f));
 		vOut.texcoord0 = vTexcoord;
 		vOut.eyePos = eyePos;
 		vOut.texHeight = primitive.diffuseTexHeight;
 		vOut.texWidth = primitive.diffuseTexWidth;
+		vOut.dev_diffuseTex = primitive.dev_diffuseTex;
+
 
 		primitive.dev_verticesOut[vid] = vOut;
 
@@ -768,9 +771,12 @@ void _rasterizeTriangles(int numPrimitives, int numFragments, int width, Fragmen
 
 	if (iid < numPrimitives) {
 		Primitive triangle = dev_primitives[iid];
-		glm::vec3 tri[3] = { glm::vec3(triangle.v[0].pos), 
-							 glm::vec3(triangle.v[1].pos), 
-							 glm::vec3(triangle.v[2].pos) };
+		VertexOut vert0 = triangle.v[0];
+		VertexOut vert1 = triangle.v[1];
+		VertexOut vert2 = triangle.v[2];
+		glm::vec3 tri[3] = { glm::vec3(vert0.pos), 
+							 glm::vec3(vert1.pos), 
+							 glm::vec3(vert2.pos) };
 		AABB boundingBox = getAABBForTriangle(tri);
 
 		for (int y = boundingBox.min.y; y < boundingBox.max.y; y++) {
@@ -779,30 +785,27 @@ void _rasterizeTriangles(int numPrimitives, int numFragments, int width, Fragmen
 				glm::vec3 bary = calculateBarycentricCoordinate(tri, glm::vec2((float)x, (float)y));
 				if (isBarycentricCoordInBounds(bary)) {
 					// eyePos
-					glm::vec3 eyePos[3] = { triangle.v[0].eyePos, triangle.v[1].eyePos, triangle.v[2].eyePos };
+					glm::vec3 eyePos[3] = { vert0.eyePos, vert1.eyePos, vert2.eyePos };
 					f.eyePos = barycentricInterpolation(eyePos, bary);
 
 					// eyeNormals
-					glm::vec3 eyeNormals[3] = { triangle.v[0].eyeNor, triangle.v[1].eyeNor, triangle.v[2].eyeNor };
+					glm::vec3 eyeNormals[3] = { vert0.eyeNor, vert1.eyeNor, vert2.eyeNor };
 					f.eyeNor = barycentricInterpolation(eyeNormals, bary);
 
 					// pos
 					glm::vec3 pos = barycentricInterpolation(tri, bary);
 
 					// textures: 
-					// TODO Perspective correction
-					glm::vec2 texCoord[3] = { triangle.v[0].texcoord0, triangle.v[1].texcoord0, triangle.v[2].texcoord0 };
-					glm::vec2 texCoordinate = glm::vec2(perspectiveInterp(texCoord, bary));
 
-					f.texcoord0 = glm::vec2(texCoordinate.x*triangle.v[0].texWidth, texCoordinate.y * triangle.v[0].texHeight);
+					glm::vec2 texCoord[3] = { vert0.texcoord0/vert0.pos.z, vert1.texcoord0/vert1.pos.z, vert2.texcoord0/vert2.pos.z };
+					glm::vec2 texCoordinate = pos.z * glm::vec2(perspectiveInterp(texCoord, bary));
 
-					//f.texcoord0.x *= triangle.v[0].texWidth;
-					//f.texcoord0.y *= triangle.v[0].texHeight;
+					f.texcoord0 = glm::vec2(texCoordinate.x, texCoordinate.y);
 					
-					f.color = glm::vec3(0.3f, 0.0f, 0.3f);
-					f.dev_diffuseTex = triangle.v[0].dev_diffuseTex;
-					f.texWidth = triangle.v[0].texWidth;
-					f.texHeight = triangle.v[0].texHeight;
+					f.color = glm::vec3(0.01f, 0.0f, 0.0f);
+					f.dev_diffuseTex = vert0.dev_diffuseTex;
+					f.texWidth = vert0.texWidth;
+					f.texHeight = vert0.texHeight;
 					
 					// Depth Buffering
 					int old = dev_depth[y*width + x];
@@ -826,6 +829,71 @@ void _rasterizeTriangles(int numPrimitives, int numFragments, int width, Fragmen
 
 				}
 			}
+		}
+	}
+}
+
+__global__
+void _rasterizePoints(int numPrimitives, int numFragments, int width, Fragment* dev_fragments, Primitive* dev_primitives, int* dev_depth, unsigned int * dev_mutex) {
+	int iid = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (iid < numPrimitives) {
+		Primitive triangle = dev_primitives[iid];
+
+		for (int i = 0; i < 3; i++) {
+			Fragment f;
+			int x = triangle.v[i].pos.x;
+			int y = triangle.v[i].pos.y;
+			f.color = triangle.v[i].eyeNor;
+			dev_fragments[y*width + x] = f;
+		}
+		
+	}
+}
+
+__global__
+void _rasterizeLines(int numPrimitives, int numFragments, int width, Fragment* dev_fragments, Primitive* dev_primitives, int* dev_depth, unsigned int * dev_mutex) {
+	int iid = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (iid < numPrimitives) {
+		Primitive triangle = dev_primitives[iid];
+		for (int i = 0; i < 3; i++) {
+			Fragment f;
+			f.color = triangle.v[i].eyeNor;
+			int x1 = triangle.v[i].pos.x;
+			int y1 = triangle.v[i].pos.y;
+			int x2 = triangle.v[(i + 1) % 3].pos.x;
+			int y2 = triangle.v[(i + 1) % 3].pos.y;
+			int y = min(y1, y2);
+
+			glm::vec2 p1 = glm::vec2(x1, y1);
+			glm::vec2 p2 = glm::vec2(x2, y2);
+
+			// swap if necessary
+			if (x1 > x2) {
+				glm::vec2 temp = p1;
+				p1 = p2;
+				p2 = temp;
+			}
+
+			// get slope
+			float m = (float)(p2.y - p1.y) / (float)(p2.x - p1.x);
+			if (m == INFINITY) {
+				int ymin = y;
+				int ymax = max(y1, y2);
+				for (int qy = ymin; qy < ymax; qy++) {
+					dev_fragments[y*width + x1] = f;
+				}
+			}
+			else {
+				int dx = p2.x - p1.x; 
+				for (int dxe = 0; dxe < dx - 1; dxe++) {
+					int dye = (int)( dxe * m + y);
+					int index = dye*width + dxe + p1.x;
+					dev_fragments[index] = f;
+				}
+			}
+
 		}
 	}
 }
@@ -887,8 +955,13 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	// TODO: rasterize
 	dim3 numThreadsPerBlock(128);
 	dim3 numBlocksForPrimitives((curPrimitiveBeginId + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
+#if TRIANGLE
 	_rasterizeTriangles << < numBlocksForPrimitives, numThreadsPerBlock >> > (curPrimitiveBeginId, width*height, width, dev_fragmentBuffer, dev_primitives, dev_depth, dev_mutex);
-
+#elif POINT
+	_rasterizePoints << < numBlocksForPrimitives, numThreadsPerBlock >> > (curPrimitiveBeginId, width*height, width, dev_fragmentBuffer, dev_primitives, dev_depth, dev_mutex);
+#elif LINE
+	_rasterizeLines << < numBlocksForPrimitives, numThreadsPerBlock >> > (curPrimitiveBeginId, width*height, width, dev_fragmentBuffer, dev_primitives, dev_depth, dev_mutex);
+#endif
 
     // Copy depthbuffer colors into framebuffer
 	render << <blockCount2d, blockSize2d >> >(width, height, dev_fragmentBuffer, dev_framebuffer);
