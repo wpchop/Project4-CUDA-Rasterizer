@@ -104,6 +104,12 @@ namespace {
 
 }
 
+PerformanceTimer& timer()
+{
+	static PerformanceTimer timer;
+	return timer;
+}
+
 static std::map<std::string, std::vector<PrimitiveDevBufPointers>> mesh2PrimitivesMap;
 
 
@@ -914,6 +920,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	// Execute your rasterization pipeline here
 	// (See README for rasterization pipeline outline.)
 
+	timer().startCpuTimer();
 	// Vertex Process & primitive assembly
 	{
 		curPrimitiveBeginId = 0;
@@ -948,6 +955,8 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 
 		checkCUDAError("Vertex Processing and Primitive Assembly");
 	}
+	timer().endCpuTimer();
+	printElapsedTime(timer().getCpuElapsedTimeForPreviousOperation(), "VERTEX ASSEMBLY");
 	
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
 	initDepth << <blockCount2d, blockSize2d >> >(width, height, dev_depth, dev_mutex);
@@ -955,6 +964,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	// TODO: rasterize
 	dim3 numThreadsPerBlock(128);
 	dim3 numBlocksForPrimitives((curPrimitiveBeginId + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
+	timer().startCpuTimer();
 #if TRIANGLE
 	_rasterizeTriangles << < numBlocksForPrimitives, numThreadsPerBlock >> > (curPrimitiveBeginId, width*height, width, dev_fragmentBuffer, dev_primitives, dev_depth, dev_mutex);
 #elif POINT
@@ -962,10 +972,17 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 #elif LINE
 	_rasterizeLines << < numBlocksForPrimitives, numThreadsPerBlock >> > (curPrimitiveBeginId, width*height, width, dev_fragmentBuffer, dev_primitives, dev_depth, dev_mutex);
 #endif
+	timer().endCpuTimer();
+	printElapsedTime(timer().getCpuElapsedTimeForPreviousOperation(), "RASTERIZATION");
 
+
+	timer().startCpuTimer();
     // Copy depthbuffer colors into framebuffer
 	render << <blockCount2d, blockSize2d >> >(width, height, dev_fragmentBuffer, dev_framebuffer);
 	checkCUDAError("fragment shader");
+	timer().endCpuTimer();
+	printElapsedTime(timer().getCpuElapsedTimeForPreviousOperation(), "FRAGMENT SHADER");
+
     // Copy framebuffer into OpenGL buffer for OpenGL previewing
     sendImageToPBO<<<blockCount2d, blockSize2d>>>(pbo, width, height, dev_framebuffer);
     checkCUDAError("copy render result to pbo");
